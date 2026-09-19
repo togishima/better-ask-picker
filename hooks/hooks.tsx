@@ -4,22 +4,32 @@ const TOOL_NAME = 'pick';
 const FULL_TOOL_NAME = 'mcp__better-ask-picker__pick';
 const PANE_ID = 'ask-picker';
 
-// hotkey は数字1桁か小文字1字。y/n は決定・キャンセル用に空けておく。
-const HOTKEYS = '123456789abcdefghijklmopqrstuvwxz';
+// hotkey は数字1桁か小文字1字。y/n/b は決定・キャンセル・戻るに空けておく。
+const HOTKEYS = '123456789acdefghijklmopqrstuvwxz';
 const CONFIRM_HOTKEY = 'y';
 const CANCEL_HOTKEY = 'n';
+const BACK_HOTKEY = 'b';
 
 // 待機の上限（$.process.run の timeoutMs 上限は10分）
 const WAIT_TIMEOUT_MS = 600_000;
 
 type Option = { label: string; description?: string };
 
-type Session = {
+type Question = {
   question: string;
   summary?: string;
   options: Option[];
   multiSelect: boolean;
-  selected: Set<number>;
+};
+
+type Item = Question & { selected: Set<number> };
+
+type Session = {
+  items: Item[];
+  // 表示中の設問（items の添字）
+  index: number;
+  // `questions` で渡されたか。true なら戻り値を answers 配列にする
+  isBatch: boolean;
   status: 'open' | 'done' | 'cancelled';
   sentinel: string;
 };
@@ -42,25 +52,42 @@ const finish = async ($: any, s: Session, status: 'done' | 'cancelled') => {
   await $.process.run(['touch', s.sentinel]);
 };
 
-const answerOf = (s: Session) =>
-  s.status === 'done'
-    ? { selected: [...s.selected].sort((a, b) => a - b).map((i) => s.options[i]?.label ?? '') }
-    : { selected: [] as string[], cancelled: true };
+const selectedLabels = (it: Item) =>
+  [...it.selected].sort((a, b) => a - b).map((i) => it.options[i]?.label ?? '');
+
+const cancelledAnswer = (s: Session) =>
+  s.isBatch ? { answers: [], cancelled: true } : { selected: [] as string[], cancelled: true };
+
+const answerOf = (s: Session) => {
+  if (s.status !== 'done') return cancelledAnswer(s);
+  if (s.isBatch) {
+    return {
+      answers: s.items.map((it) => ({ question: it.question, selected: selectedLabels(it) })),
+    };
+  }
+  const only = s.items[0];
+  return { selected: only ? selectedLabels(only) : [] };
+};
 
 // ペインを出せない環境（幅が足りない等）向け: ネイティブダイアログで4択ずつ聞く。
 // multiSelect は4個ずつのチャンクをそれぞれ複数選択で聞いて連結する。
+// キャンセル（ダイアログを閉じた）は null。
 // 既知の制限: ラベルにカンマを含むと、複数選択の回答の分割がずれる。
-const askWithNativeDialog = async ($: any, s: Session) => {
-  const header = s.summary ? `${s.question}\n${s.summary}` : s.question;
-  const labels = s.options.map((o) => o.label);
+const askOneWithNativeDialog = async (
+  $: any,
+  q: Question,
+  tag: string
+): Promise<string[] | null> => {
+  const header = `${tag}${q.summary ? `${q.question}\n${q.summary}` : q.question}`;
+  const labels = q.options.map((o) => o.label);
   try {
-    if (s.multiSelect) {
+    if (q.multiSelect) {
       const chunks: string[][] = [];
       for (let i = 0; i < labels.length; i += 4) chunks.push(labels.slice(i, i + 4));
       const picked: string[] = [];
       for (const [n, chunk] of chunks.entries()) {
-        const q = chunks.length > 1 ? `${header} (${n + 1}/${chunks.length})` : header;
-        const answer: string = await $.ui.ask(q, { options: chunk, multiSelect: true });
+        const text = chunks.length > 1 ? `${header} (${n + 1}/${chunks.length})` : header;
+        const answer: string = await $.ui.ask(text, { options: chunk, multiSelect: true });
         picked.push(
           ...answer
             .split(',')
@@ -68,7 +95,7 @@ const askWithNativeDialog = async ($: any, s: Session) => {
             .filter(Boolean)
         );
       }
-      return { selected: picked };
+      return picked;
     }
     const Prev = '← 前へ';
     const Next = '→ 次へ';
@@ -79,23 +106,32 @@ const askWithNativeDialog = async ($: any, s: Session) => {
       const nav: string[] = [];
       if (page > 0) nav.push(Prev);
       if (start + 2 < labels.length) nav.push(Next);
-      const q = pageCount > 1 ? `${header} (${page + 1}/${pageCount})` : header;
-      const chosen: string = await $.ui.ask(q, [...labels.slice(start, start + 2), ...nav]);
+      const text = pageCount > 1 ? `${header} (${page + 1}/${pageCount})` : header;
+      const chosen: string = await $.ui.ask(text, [...labels.slice(start, start + 2), ...nav]);
       if (chosen === Next) page += 1;
       else if (chosen === Prev) page -= 1;
-      else return { selected: [chosen] };
+      else return [chosen];
     }
   } catch {
-    return { selected: [] as string[], cancelled: true };
+    return null;
   }
 };
 
-const parseInput = (
-  e: unknown
-):
-  | { ok: true; value: Omit<Session, 'selected' | 'status' | 'sentinel'> }
-  | { ok: false; error: string } => {
-  const input = e as {
+const askAllWithNativeDialog = async ($: any, s: Session) => {
+  const answers: { question: string; selected: string[] }[] = [];
+  for (const [k, it] of s.items.entries()) {
+    const tag = s.items.length > 1 ? `(${k + 1}/${s.items.length}) ` : '';
+    const picked = await askOneWithNativeDialog($, it, tag);
+    if (!picked) return cancelledAnswer(s);
+    answers.push({ question: it.question, selected: picked });
+  }
+  return s.isBatch ? { answers } : { selected: answers[0]?.selected ?? [] };
+};
+
+type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const parseQuestion = (raw: unknown): Parsed<Question> => {
+  const input = (raw ?? {}) as {
     question?: unknown;
     summary?: unknown;
     options?: unknown;
@@ -108,8 +144,8 @@ const parseInput = (
     return { ok: false, error: 'options には2個以上の選択肢が必要です' };
   }
   const options: Option[] = [];
-  for (const raw of input.options) {
-    const o = raw as { label?: unknown; description?: unknown };
+  for (const rawOption of input.options) {
+    const o = rawOption as { label?: unknown; description?: unknown };
     if (typeof o?.label !== 'string' || o.label.length === 0) {
       return { ok: false, error: '各 option には空でない label が必要です' };
     }
@@ -129,35 +165,86 @@ const parseInput = (
   };
 };
 
+const parseInput = (e: unknown): Parsed<{ questions: Question[]; isBatch: boolean }> => {
+  const input = e as { questions?: unknown; question?: unknown; options?: unknown };
+  if (input.questions !== undefined) {
+    if (input.question !== undefined || input.options !== undefined) {
+      return { ok: false, error: 'question/options と questions は同時に指定できません' };
+    }
+    if (!Array.isArray(input.questions) || input.questions.length === 0) {
+      return { ok: false, error: 'questions には1問以上必要です' };
+    }
+    const questions: Question[] = [];
+    for (const [k, raw] of input.questions.entries()) {
+      const parsed = parseQuestion(raw);
+      if (!parsed.ok) return { ok: false, error: `questions[${k}]: ${parsed.error}` };
+      questions.push(parsed.value);
+    }
+    return { ok: true, value: { questions, isBatch: true } };
+  }
+  const parsed = parseQuestion(e);
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: { questions: [parsed.value], isBatch: false } };
+};
+
+// ペインの高さ: 最も背の高い設問に合わせる（設問が切り替わっても高さは変えない）
+const rowsFor = (s: Session) => {
+  const tallest = Math.max(
+    ...s.items.map(
+      (it) =>
+        6 +
+        it.options.length * (it.options.some((o) => o.description) ? 2 : 1) +
+        (it.summary ? 3 : 0)
+    )
+  );
+  return Math.min(26, tallest + (s.items.length > 1 ? 2 : 0));
+};
+
 export const register: Register = (on, _options) => {
   on('session.start', async ($, e, next) => {
+    const questionSchema = {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '質問文（?で終わる）' },
+        summary: { type: 'string', description: '質問の概要・背景（Markdown、任意）' },
+        options: {
+          type: 'array',
+          minItems: 2,
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: '選択肢のラベル' },
+              description: { type: 'string', description: '選択肢の説明（任意）' },
+            },
+            required: ['label'],
+          },
+          description: '選択肢の一覧（上限なし）',
+        },
+        multiSelect: { type: 'boolean', description: 'true で複数選択（決定ボタンで確定）' },
+      },
+      required: ['question', 'options'],
+    };
     await $.tool.register({
       name: TOOL_NAME,
       description:
         '質問の概要を表示しつつ、選択肢を全件1画面に出してユーザーに選ばせる。' +
         '選択肢の数に上限はなく、multiSelect で複数選択もできる。' +
-        '戻り値は JSON 文字列 {"selected": [選んだlabel...]}（キャンセル時は cancelled: true）。',
+        '1問だけなら question/options を、複数の設問を順に聞くなら questions を使う（同時指定は不可）。' +
+        '戻り値は JSON 文字列。1問: {"selected": [選んだlabel...]}、' +
+        'questions: {"answers": [{"question": 質問文, "selected": [...]}...]}。' +
+        'キャンセル時は cancelled: true。',
       inputSchema: {
         type: 'object',
         properties: {
-          question: { type: 'string', description: '質問文（?で終わる）' },
-          summary: { type: 'string', description: '質問の概要・背景（Markdown、任意）' },
-          options: {
+          ...questionSchema.properties,
+          questions: {
             type: 'array',
-            minItems: 2,
-            items: {
-              type: 'object',
-              properties: {
-                label: { type: 'string', description: '選択肢のラベル' },
-                description: { type: 'string', description: '選択肢の説明（任意）' },
-              },
-              required: ['label'],
-            },
-            description: '選択肢の一覧（上限なし）',
+            minItems: 1,
+            items: questionSchema,
+            description:
+              '複数の設問を順に聞く場合の設問一覧（1問だけなら question/options を使う）',
           },
-          multiSelect: { type: 'boolean', description: 'true で複数選択（決定ボタンで確定）' },
         },
-        required: ['question', 'options'],
       },
     });
     // 前回のモジュールが残したペインを片付ける
@@ -175,8 +262,9 @@ export const register: Register = (on, _options) => {
     }
 
     const s: Session = {
-      ...parsed.value,
-      selected: new Set(),
+      items: parsed.value.questions.map((q) => ({ ...q, selected: new Set<number>() })),
+      index: 0,
+      isBatch: parsed.value.isBatch,
       status: 'open',
       sentinel: `/tmp/ask-picker-${Date.now()}-${Math.floor(Math.random() * 1e9)}.done`,
     };
@@ -185,24 +273,20 @@ export const register: Register = (on, _options) => {
     next.signal.addEventListener('abort', onAbort);
 
     try {
-      const rows = Math.min(
-        24,
-        6 + s.options.length * (s.options.some((o) => o.description) ? 2 : 1) + (s.summary ? 3 : 0)
-      );
       await $.ui.open({
         id: PANE_ID,
         title: '質問',
         focus: true,
         closeOnEscape: true,
         holdToasts: true,
-        rows,
+        rows: rowsFor(s),
       });
 
       const pane = (await $.ui.panes()).find((p) => p.id === PANE_ID);
       if (!pane?.isPlaced) {
         // 端末幅が足りずペインが描画されない: 待たずにネイティブダイアログへ
         await $.ui.close({ id: PANE_ID });
-        const fallback = await askWithNativeDialog($, s);
+        const fallback = await askAllWithNativeDialog($, s);
         return {
           result: JSON.stringify(fallback),
           context: [`answered (native dialog): ${JSON.stringify(fallback)}`],
@@ -242,35 +326,62 @@ export const register: Register = (on, _options) => {
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     const s = session;
     if (e.requestId !== PANE_ID || !s || s.status !== 'open') return next(e);
+    const it = s.items[s.index];
+    if (!it) return next(e);
 
     const { Box, Text, Button, Markdown } = $.ui.resolve(e);
 
-    const press = (i: number) => {
+    const total = s.items.length;
+    const isLast = s.index === total - 1;
+
+    // 次の設問へ。最後の設問なら回答を確定する
+    const advance = () => {
       if (s.status !== 'open') return;
-      if (!s.multiSelect) {
-        s.selected = new Set([i]);
+      if (s.index < total - 1) {
+        s.index += 1;
+        $.ui.invalidate('ui.render');
+      } else {
         void finish($, s, 'done');
-        return;
       }
-      if (s.selected.has(i)) s.selected.delete(i);
-      else s.selected.add(i);
-      $.ui.invalidate('ui.render');
     };
 
-    const heading = s.summary ? `**${s.question}**\n\n${s.summary}` : `**${s.question}**`;
+    const press = (i: number) => {
+      const cur = s.items[s.index];
+      if (!cur || s.status !== 'open') return;
+      if (cur.multiSelect) {
+        if (cur.selected.has(i)) cur.selected.delete(i);
+        else cur.selected.add(i);
+        $.ui.invalidate('ui.render');
+        return;
+      }
+      cur.selected = new Set([i]);
+      advance();
+    };
+
+    // 設問が複数あるときだけ、単一選択にも選択状態の印を付ける（戻ったときに分かるように）
+    const mark = (i: number) => {
+      const isSelected = it.selected.has(i);
+      if (it.multiSelect) return isSelected ? '[x] ' : '[ ] ';
+      return total > 1 ? (isSelected ? '(*) ' : '( ) ') : '';
+    };
+
+    const progress = total > 1 ? `(${s.index + 1}/${total}) ` : '';
+    const heading = it.summary
+      ? `**${progress}${it.question}**\n\n${it.summary}`
+      : `**${progress}${it.question}**`;
 
     return (
       <Box flexDirection="column">
         <Markdown text={heading} />
         <Box flexDirection="column" marginTop={1}>
-          {s.options.map((o, i) => (
+          {it.options.map((o, i) => (
             <Box flexDirection="column">
               <Button
-                key={`opt-${i}`}
+                key={`q${s.index}-opt-${i}`}
                 plain
                 autoFocus={i === 0 ? true : undefined}
                 hotkey={HOTKEYS[i]}
-                label={s.multiSelect ? `${s.selected.has(i) ? '[x]' : '[ ]'} ${o.label}` : o.label}
+                label={`${mark(i)}${o.label}`}
                 onPress={() => press(i)}
               />
               {o.description ? (
@@ -284,13 +395,26 @@ export const register: Register = (on, _options) => {
           ))}
         </Box>
         <Box marginTop={1} gap={2}>
-          {s.multiSelect ? (
+          {it.multiSelect ? (
             <Button
               key="confirm"
               plain
               hotkey={CONFIRM_HOTKEY}
-              label={`決定 (${s.selected.size}件)`}
-              onPress={() => void finish($, s, 'done')}
+              label={`${isLast ? '決定' : '次へ'} (${it.selected.size}件)`}
+              onPress={advance}
+            />
+          ) : null}
+          {s.index > 0 ? (
+            <Button
+              key="back"
+              plain
+              hotkey={BACK_HOTKEY}
+              label="戻る"
+              onPress={() => {
+                if (s.status !== 'open' || s.index === 0) return;
+                s.index -= 1;
+                $.ui.invalidate('ui.render');
+              }}
             />
           ) : null}
           <Button
