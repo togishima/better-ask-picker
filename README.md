@@ -25,6 +25,7 @@ The model calls `mcp__better-ask-picker__pick`:
 | `summary` | string | Optional. Background shown above the options (Markdown) |
 | `options` | `{ label, description? }[]` | Required, 2 or more, no upper limit |
 | `multiSelect` | boolean | `true` for multiple choice; confirm with **y** |
+| `questions` | `{ question, summary?, options, multiSelect? }[]` | Instead of the four fields above: ask several questions in a row, in one pane. Cannot be combined with `question` / `options` |
 
 Returns a JSON string:
 
@@ -32,11 +33,19 @@ Returns a JSON string:
 { "selected": ["A", "C"] }
 ```
 
-On cancel: `{ "selected": [], "cancelled": true }`.
+With `questions`, one entry per question:
+
+```json
+{ "answers": [{ "question": "Which DB?", "selected": ["Postgres"] }, { "question": "Which features?", "selected": ["A", "C"] }] }
+```
+
+On cancel: `{ "selected": [], "cancelled": true }` (`{ "answers": [], "cancelled": true }` with `questions`).
+
+With `questions`, the pane shows the progress `(1/3)`. A single-select question advances as soon as you pick; a multi-select question advances with **y**. **b** goes back to the previous question, keeping its selection.
 
 ### Keys
 
-- **1-9, then a-z** toggle (or pick, in single-select) the matching option directly. `y` confirms, `n` cancels.
+- **1-9, then a-z** (`b`, `n`, `y` excluded) toggle (or pick, in single-select) the matching option directly. `y` confirms / goes next, `b` goes back, `n` cancels.
 - Tab / arrows / Enter also work when the pane has focus. Esc closes the pane and cancels.
 - Space cannot be used for toggling: the plugin API offers no raw key events (only digit/letter hotkeys and Enter).
 
@@ -48,7 +57,7 @@ A pane a plugin opens on its own is not drawn on terminals narrower than **144 c
 
 - macOS / Linux. The wait uses `sh`, `sleep`, `touch` and `rm` via the plugin API's process runner; Windows is not supported.
 - Interactive sessions only. In `claude -p` (headless) there is nobody to ask and the call fails.
-- One question at a time; a second call while one is open is denied.
+- One call at a time; a second call while one is open is denied (e.g. two parallel tool calls). Use `questions` to ask several questions in one call.
 - The UI text ("決定", "キャンセル") and the tool description are in Japanese.
 - In the native-dialog fallback, a label containing a comma can confuse multi-select parsing.
 
