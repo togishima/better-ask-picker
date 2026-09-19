@@ -360,9 +360,9 @@ export const register: Register = (on, _options) => {
 
     // 設問が複数あるときだけ、単一選択にも選択状態の印を付ける（戻ったときに分かるように）
     const mark = (i: number) => {
-      const on = it.selected.has(i);
-      if (it.multiSelect) return on ? '[x] ' : '[ ] ';
-      return total > 1 ? (on ? '(*) ' : '( ) ') : '';
+      const isSelected = it.selected.has(i);
+      if (it.multiSelect) return isSelected ? '[x] ' : '[ ] ';
+      return total > 1 ? (isSelected ? '(*) ' : '( ) ') : '';
     };
 
     const progress = total > 1 ? `(${s.index + 1}/${total}) ` : '';
